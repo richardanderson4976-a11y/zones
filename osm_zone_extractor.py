@@ -57,9 +57,10 @@ parses, validates, and describes an entirely different tier of
 geography. Nothing downstream can detect it.
 
 So the levels are never inferred. Either the country appears in
-COUNTRY_PROFILES, verified by someone who looked, or the levels are
-supplied explicitly with --boundary-level and --child-level. A country
-that is neither is refused.
+COUNTRY_PROFILES as a verified entry, or the levels are supplied
+explicitly with --boundary-level and --child-level. Candidate entries
+may exist as reminders, but they are refused until somebody has probed
+and confirmed them. A country that is neither is refused.
 
 --probe makes the verification cheap:
 
@@ -112,10 +113,11 @@ substituted from the bounding box, for the same reason as in the US
 path: a null is visible and fails validation, a silently different
 measurement is neither.
 
-Computing a guaranteed-interior point from the full polygon would work
-everywhere and is the obvious upgrade. It needs full geometry, which
-is megabytes rather than kilobytes per run, and a geometry library.
-Deliberately not bolted on here.
+Computing a guaranteed-interior point from the full polygon does now
+exist as a fallback, but only after admin_centre and label have both
+failed. The seat remains the better anchor where one is tagged, and the
+full-geometry fetch is still expensive enough that it is worth saving
+for the minority of relations that need it.
 
 WHY THE MARKET BOUNDARY ZONE HAS NO POINT
 -----------------------------------------
@@ -192,6 +194,35 @@ guessing anywhere.
    member nodes and population from OSM population tags, both cited at
    their real authority tier, both null where absent.
 
+CHANGES IN 3.1.0
+----------------
+Four improvements to the generic (non-US) path only.
+
+1. POLYGON INTERIOR POINTS. When a child relation has no
+   admin_centre and no label node, its geometry is fetched from
+   Overpass and shapely's representative_point() computes a
+   guaranteed-interior point. Fallback order: admin_centre node
+   → label node → polygon interior point → null. Requires shapely;
+   degrades gracefully without it.
+
+2. GEOMETRY-BASED CONTAINMENT FILTER. The market boundary polygon
+   is fetched once; each child whose representative point falls
+   outside it is excluded. Children without a point are included
+   but flagged as untestable.
+
+3. OVERPASS 429 RESILIENCE. The Retry-After response header is
+   honoured. Responses that resulted from a failed or
+   rate-limited request are never cached. Zero-element returns
+   from non-empty batches trigger a prominent warning. A third
+   Overpass mirror is added.
+
+4. --probe-batch AND CANDIDATE PROFILES. CountryProfile now has a
+   verified flag. CANDIDATE profiles (verified=False) for eight
+   African countries are added; they are refused at runtime
+   without explicit levels. --probe-batch runs multiple probes
+   in one command. --list-countries now shows VERIFIED vs
+   CANDIDATE.
+
 CHANGES IN 2.4.0
 ----------------
 Two defects found by the Section 02 deterministic validator, both
@@ -231,8 +262,28 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Optional
 
+# When this file is imported via importlib.util.module_from_spec() in a
+# direct test, the caller may not insert the module into sys.modules
+# first. dataclasses consult sys.modules while processing annotations,
+# so register a placeholder early enough that those lookups succeed.
+if __name__ not in sys.modules:
+    import types
 
-EXTRACTOR_VERSION = "3.0.0"
+    sys.modules[__name__] = types.ModuleType(__name__)
+    sys.modules[__name__].__dict__.update(globals())
+
+# shapely is optional. The polygon interior point upgrade (3.1.0) uses it
+# where available; where it is absent the fallback is null, exactly as
+# before. Import lazily so a missing library does not break US runs.
+try:
+    from shapely.geometry import Polygon, MultiPolygon, Point
+    from shapely.ops import unary_union
+    _SHAPELY_AVAILABLE = True
+except ImportError:
+    _SHAPELY_AVAILABLE = False
+
+
+EXTRACTOR_VERSION = "3.1.0"
 
 USER_AGENT = (
     f"limo-market-pack-zone-extractor/{EXTRACTOR_VERSION} "
@@ -242,6 +293,7 @@ USER_AGENT = (
 OVERPASS_ENDPOINTS = (
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
 )
 
 # The wiki page defining boundary=administrative.
@@ -262,6 +314,11 @@ OSM_ADMIN_CENTRE_DOCUMENTATION_URL = (
 
 OSM_POPULATION_DOCUMENTATION_URL = (
     "https://wiki.openstreetmap.org/wiki/Key:population"
+)
+
+OSM_GEOMETRY_DOCUMENTATION_URL = (
+    "https://wiki.openstreetmap.org/wiki/Overpass_API/Overpass_QL"
+    "#out_geom"
 )
 
 OSM_RELATION_URL_PREFIX = "https://www.openstreetmap.org/relation/"
@@ -296,8 +353,10 @@ PROBE_LEVELS = (2, 3, 4, 5, 6, 7, 8)
 # COUNTRY PROFILES
 # ============================================================
 #
-# Every entry here was verified by someone who ran --probe and read
-# the result. Nothing in this table is inferred.
+# VERIFIED entries here were confirmed by someone who ran --probe and
+# read the result. CANDIDATE entries are documented hypotheses kept
+# visible on purpose, so they can be probed and promoted rather than
+# guessed from scratch twice.
 #
 # reference_strategy decides which path a market takes:
 #
@@ -308,10 +367,10 @@ PROBE_LEVELS = (2, 3, 4, 5, 6, 7, 8)
 #                population, no cross-reference filter. Tier 1 for
 #                identity, tier 3 for population.
 #
-# Adding a country means running --probe, reading which level holds
-# the tier you want, and writing an entry. It does not mean guessing
-# from a neighbouring country: Kenya and Nigeria are adjacent in a
-# list and three levels apart in practice.
+# Adding a VERIFIED country means running --probe, reading which level
+# holds the tier you want, and writing an entry. It does not mean
+# guessing from a neighbouring country: Kenya and Nigeria are adjacent
+# in a list and three levels apart in practice.
 
 REFERENCE_US_CENSUS = "us-census"
 REFERENCE_GENERIC = "generic"
@@ -326,6 +385,7 @@ class CountryProfile:
     child_zone_type: str
     reference_strategy: str = REFERENCE_GENERIC
     notes: str = ""
+    verified: bool = True
 
 
 COUNTRY_PROFILES: dict[str, CountryProfile] = {
@@ -549,6 +609,114 @@ COUNTRY_PROFILES: dict[str, CountryProfile] = {
             "Level 4 is region, level 6 is province or prefecture."
         ),
     ),
+    "UG": CountryProfile(
+        country_name="Uganda",
+        boundary_level=4,
+        child_level=6,
+        boundary_zone_type="province",
+        child_zone_type="district",
+        verified=False,
+        notes=(
+            "CANDIDATE: plausible levels, not probe-verified. Run "
+            "--probe UG and read the result before promoting to "
+            "verified=True. Uganda's 130+ districts may sit at "
+            "level 4 OR level 6 depending on tagging era, making "
+            "the probe especially necessary."
+        ),
+    ),
+    "ZM": CountryProfile(
+        country_name="Zambia",
+        boundary_level=4,
+        child_level=6,
+        boundary_zone_type="province",
+        child_zone_type="district",
+        verified=False,
+        notes=(
+            "CANDIDATE: plausible levels, not probe-verified. Run "
+            "--probe ZM and read the result before promoting to "
+            "verified=True."
+        ),
+    ),
+    "ZW": CountryProfile(
+        country_name="Zimbabwe",
+        boundary_level=4,
+        child_level=6,
+        boundary_zone_type="province",
+        child_zone_type="district",
+        verified=False,
+        notes=(
+            "CANDIDATE: plausible levels, not probe-verified. Run "
+            "--probe ZW and read the result before promoting to "
+            "verified=True."
+        ),
+    ),
+    "BW": CountryProfile(
+        country_name="Botswana",
+        boundary_level=4,
+        child_level=6,
+        boundary_zone_type="province",
+        child_zone_type="district",
+        verified=False,
+        notes=(
+            "CANDIDATE: plausible levels, not probe-verified. Run "
+            "--probe BW and read the result before promoting to "
+            "verified=True. Sparse Kalahari mapping is correct rather "
+            "than missing."
+        ),
+    ),
+    "NA": CountryProfile(
+        country_name="Namibia",
+        boundary_level=4,
+        child_level=6,
+        boundary_zone_type="province",
+        child_zone_type="district",
+        verified=False,
+        notes=(
+            "CANDIDATE: plausible levels, not probe-verified. Run "
+            "--probe NA and read the result before promoting to "
+            "verified=True."
+        ),
+    ),
+    "MW": CountryProfile(
+        country_name="Malawi",
+        boundary_level=4,
+        child_level=6,
+        boundary_zone_type="province",
+        child_zone_type="district",
+        verified=False,
+        notes=(
+            "CANDIDATE: plausible levels, not probe-verified. Run "
+            "--probe MW and read the result before promoting to "
+            "verified=True."
+        ),
+    ),
+    "ET": CountryProfile(
+        country_name="Ethiopia",
+        boundary_level=4,
+        child_level=6,
+        boundary_zone_type="province",
+        child_zone_type="district",
+        verified=False,
+        notes=(
+            "CANDIDATE: plausible levels, not probe-verified. Run "
+            "--probe ET and read the result before promoting to "
+            "verified=True. Regional-state reorganizations may make "
+            "OSM lag official boundaries."
+        ),
+    ),
+    "MZ": CountryProfile(
+        country_name="Mozambique",
+        boundary_level=4,
+        child_level=6,
+        boundary_zone_type="province",
+        child_zone_type="district",
+        verified=False,
+        notes=(
+            "CANDIDATE: plausible levels, not probe-verified. Run "
+            "--probe MZ and read the result before promoting to "
+            "verified=True."
+        ),
+    ),
 }
 
 
@@ -766,6 +934,18 @@ class Fetcher:
             )
             return None
 
+        if (
+            getattr(self, "_last_attempt_had_429", False)
+            and isinstance(payload, dict)
+            and payload.get("elements") == []
+        ):
+            self.log.warn(
+                "Overpass returned empty elements after a 429 during "
+                "this batch — result may be rate-limit truncation; "
+                "skipping cache to force re-fetch on next run."
+            )
+            return payload
+
         try:
             with gzip.open(path, "wt", encoding="utf-8") as handle:
                 json.dump(payload, handle)
@@ -816,6 +996,9 @@ class Fetcher:
         def safe_url() -> str:
             return url.replace(redact, "REDACTED") if redact else url
 
+        had_429 = False
+        self._last_attempt_had_429 = False
+
         for attempt in range(1, MAX_RETRIES + 1):
             request = urllib.request.Request(
                 url,
@@ -829,13 +1012,39 @@ class Fetcher:
                 with urllib.request.urlopen(
                     request, timeout=REQUEST_TIMEOUT_SECONDS
                 ) as response:
-                    return response.read()
+                    raw = response.read()
+                    self._last_attempt_had_429 = had_429
+                    return raw
 
             except urllib.error.HTTPError as error:
                 # 429 and 5xx are the service saying it is busy, and
                 # worth retrying. A 400 or 404 is not, because the
                 # request itself is wrong.
-                if error.code in {429, 500, 502, 503, 504}:
+                if error.code == 429:
+                    had_429 = True
+                    self._last_attempt_had_429 = True
+
+                    retry_after = None
+                    header_value = error.headers.get("Retry-After")
+
+                    if header_value is not None:
+                        try:
+                            retry_after = min(120.0, float(header_value))
+                        except (TypeError, ValueError):
+                            retry_after = None
+
+                    self.log.warn(
+                        f"Server returned {error.code}, attempt "
+                        f"{attempt} of {MAX_RETRIES}. Waiting."
+                    )
+                    time.sleep(
+                        retry_after
+                        if retry_after is not None
+                        else RETRY_DELAY_SECONDS * attempt
+                    )
+                    continue
+
+                if error.code in {500, 502, 503, 504}:
                     self.log.warn(
                         f"Server returned {error.code}, attempt "
                         f"{attempt} of {MAX_RETRIES}. Waiting."
@@ -1457,6 +1666,14 @@ out ids tags;
             f"admin-centres-{batch[0]}-{len(batch)}",
         )
 
+        if not elements and batch:
+            log.warn(
+                f"{len(batch)} relations queried, 0 elements returned "
+                "— likely rate limiting; re-run in a few minutes or "
+                "clear the matching cache entries"
+            )
+            continue
+
         # === LABEL_PROVENANCE_FIX_V1 ===
         # First pass: relation ID to (node ID, role). The role is
         # kept because a label node is a WEAKER point than an
@@ -1527,6 +1744,259 @@ out ids tags;
     )
 
     return result
+
+
+def fetch_geometry_for_relations(
+    fetcher: Fetcher,
+    log: RunLog,
+    relation_ids: list[int],
+) -> dict[int, dict[str, Any]]:
+    """
+    Fetch the full geometry for a list of relation IDs using
+    Overpass's ``out geom`` output modifier.
+
+    Returns a mapping of relation ID to a dict with keys:
+      ``lat``, ``lon``  — shapely representative_point(), or None
+      ``basis``         — always "polygon-representative-point"
+
+    Relations that fail to assemble a valid polygon, or where shapely
+    is unavailable, are absent from the result.
+
+    Geometry responses are much larger than identity queries — megabytes
+    rather than kilobytes — so batch size is kept small (10) and only
+    relations that genuinely lack an admin_centre or label point are
+    passed here.
+    """
+    if not relation_ids:
+        return {}
+
+    if not _SHAPELY_AVAILABLE:
+        log.warn(
+            "shapely is not installed; polygon interior points are "
+            "unavailable for this run.",
+            "Install it with: pip install shapely>=2.0",
+        )
+        return {}
+
+    batch_size = 10
+    result: dict[int, dict[str, Any]] = {}
+
+    for start in range(0, len(relation_ids), batch_size):
+        batch = relation_ids[start:start + batch_size]
+        id_list = ",".join(str(r) for r in batch)
+
+        query = f"""
+[out:json][timeout:300];
+relation(id:{id_list});
+out geom;
+"""
+
+        elements = overpass_query(
+            fetcher,
+            log,
+            query,
+            f"geom-{batch[0]}-{len(batch)}",
+        )
+
+        if not elements and batch:
+            log.warn(
+                f"{len(batch)} relations queried, 0 elements returned "
+                "— likely rate limiting; re-run in a few minutes or "
+                "clear the matching cache entries"
+            )
+            continue
+
+        for element in elements:
+            if element.get("type") != "relation":
+                continue
+
+            relation_id = element.get("id")
+            members = element.get("members") or []
+
+            # Build outer and inner rings from way geometry. Overpass
+            # includes coordinates directly on each way member when
+            # ``out geom`` is used; there is no need for a second
+            # round-trip to resolve node IDs.
+            outers: list[list[tuple[float, float]]] = []
+            inners: list[list[tuple[float, float]]] = []
+
+            for member in members:
+                if member.get("type") != "way":
+                    continue
+
+                role = str(member.get("role", "")).strip()
+                geometry = member.get("geometry") or []
+
+                coords = [
+                    (pt["lon"], pt["lat"])
+                    for pt in geometry
+                    if isinstance(pt.get("lon"), (int, float))
+                    and isinstance(pt.get("lat"), (int, float))
+                ]
+
+                if len(coords) < 3:
+                    continue
+
+                if role == "inner":
+                    inners.append(coords)
+                else:
+                    # outer or blank role: treat as outer.
+                    outers.append(coords)
+
+            if not outers:
+                continue
+
+            try:
+                # Build shapely polygons from the outer rings, then
+                # punch holes with the inner rings. Defensive about
+                # broken rings: if any single polygon fails, log and
+                # skip rather than emitting a wrong point.
+                polys = []
+
+                for ring in outers:
+                    try:
+                        polys.append(Polygon(ring))
+                    except Exception:
+                        pass
+
+                hole_polys = []
+
+                for ring in inners:
+                    try:
+                        hole_polys.append(Polygon(ring))
+                    except Exception:
+                        pass
+
+                if not polys:
+                    continue
+
+                geom = unary_union(polys)
+
+                for hole in hole_polys:
+                    try:
+                        geom = geom.difference(hole)
+                    except Exception:
+                        pass
+
+                pt = geom.representative_point()
+                result[relation_id] = {
+                    "lat": pt.y,
+                    "lon": pt.x,
+                    "basis": "polygon-representative-point",
+                }
+
+            except Exception as exc:
+                log.warn(
+                    f"Polygon assembly failed for relation "
+                    f"{relation_id}: {exc}. Leaving point null."
+                )
+
+    if result:
+        log.info(
+            f"Computed {len(result)} polygon interior points from "
+            f"{len(relation_ids)} relations."
+        )
+
+    return result
+
+
+def fetch_boundary_polygon(
+    fetcher: Fetcher,
+    log: RunLog,
+    relation_id: int,
+) -> Optional[Any]:
+    """
+    Fetch the full geometry for the market boundary relation and
+    return a shapely (Multi)Polygon, or None if unavailable.
+
+    Used by the geometry containment filter to test whether each
+    child's representative point lies inside the market boundary.
+    """
+    if not _SHAPELY_AVAILABLE:
+        return None
+
+    query = f"""
+[out:json][timeout:300];
+relation(id:{relation_id});
+out geom;
+"""
+
+    elements = overpass_query(
+        fetcher,
+        log,
+        query,
+        f"boundary-geom-{relation_id}",
+    )
+
+    for element in elements:
+        if (
+            element.get("type") != "relation"
+            or element.get("id") != relation_id
+        ):
+            continue
+
+        members = element.get("members") or []
+        outers: list[list[tuple[float, float]]] = []
+        inners: list[list[tuple[float, float]]] = []
+
+        for member in members:
+            if member.get("type") != "way":
+                continue
+
+            role = str(member.get("role", "")).strip()
+            geometry = member.get("geometry") or []
+            coords = [
+                (pt["lon"], pt["lat"])
+                for pt in geometry
+                if isinstance(pt.get("lon"), (int, float))
+                and isinstance(pt.get("lat"), (int, float))
+            ]
+
+            if len(coords) < 3:
+                continue
+
+            if role == "inner":
+                inners.append(coords)
+            else:
+                outers.append(coords)
+
+        if not outers:
+            return None
+
+        try:
+            polys = []
+
+            for ring in outers:
+                try:
+                    polys.append(Polygon(ring))
+                except Exception:
+                    pass
+
+            if not polys:
+                return None
+
+            geom = unary_union(polys)
+
+            for ring in inners:
+                try:
+                    geom = geom.difference(Polygon(ring))
+                except Exception:
+                    pass
+
+            return geom
+
+        except Exception as exc:
+            log.warn(
+                f"Failed to assemble boundary polygon for relation "
+                f"{relation_id}: {exc}"
+            )
+            return None
+
+    log.warn(
+        f"Boundary relation {relation_id} geometry not returned "
+        "by Overpass."
+    )
+    return None
 
 
 # ============================================================
@@ -1698,6 +2168,9 @@ class ZoneContext:
     admin_centres: dict[int, dict[str, Any]] = field(
         default_factory=dict
     )
+    geometry_interior_points: dict[int, dict[str, Any]] = field(
+        default_factory=dict
+    )
 
     @property
     def is_us_census(self) -> bool:
@@ -1810,16 +2283,28 @@ def build_zone(
                 else "osm-admin-centre-node"
             )
         else:
-            centre = {"lat": None, "lon": None, "source_ids": []}
+            interior = context.geometry_interior_points.get(relation_id)
 
-            log.warn(
-                f"{name} has no admin_centre member node, so its "
-                "representative point is null.",
-                "The OSM bounding-box centre is not substituted: it "
-                "is a different measurement and can fall outside an "
-                "irregular boundary entirely. The research pass must "
-                "supply a point that lies inside the area.",
-            )
+            if interior is not None:
+                centre = {
+                    "lat": interior["lat"],
+                    "lon": interior["lon"],
+                    "source_ids": ["src-osm-geometry-interior-point"],
+                }
+                centre_source = "src-osm-geometry-interior-point"
+                centre_basis = "polygon-representative-point"
+            else:
+                centre = {"lat": None, "lon": None, "source_ids": []}
+
+                log.warn(
+                    f"{name} has no usable admin_centre or label node, "
+                    "and no polygon interior point could be computed, "
+                    "so its representative point is null.",
+                    "The OSM bounding-box centre is not substituted: it "
+                    "is a different measurement and can fall outside an "
+                    "irregular boundary entirely. The research pass must "
+                    "supply a point that lies inside the area.",
+                )
 
     if geoid:
         external_ids.append(
@@ -2039,7 +2524,8 @@ def build_zone(
                 )
             else:
                 limitations.append(
-                    "No admin_centre member node on this relation, so "
+                    "No admin_centre or label member node was usable, "
+                    "and no polygon interior point was available, so "
                     "the representative point is absent. The OSM "
                     "bounding-box centre was not substituted because "
                     "it is a different measurement."
@@ -2068,6 +2554,13 @@ def build_zone(
             verification.append(
                 "Confirm the label-derived representative point lies "
                 "inside the boundary, or replace it."
+            )
+        elif centre_basis == "polygon-representative-point":
+            limitations.append(
+                "The representative point is computed from the boundary "
+                "polygon: guaranteed to lie inside the boundary, but "
+                "not an administrative seat or official reference "
+                "coordinate."
             )
 
         if population is None:
@@ -2216,6 +2709,7 @@ def build_sources(
     include_census_population: bool,
     include_admin_centre: bool,
     include_osm_population: bool,
+    include_geometry_interior_point: bool = False,
     boundary_relation_id: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     """
@@ -2381,6 +2875,73 @@ def build_sources(
                     "used as a weaker fallback. A label marks where a "
                     "renderer should draw the name, which is usually "
                     "but not always a sensible interior point.",
+                ],
+                "notes": None,
+            }
+        )
+
+    if include_geometry_interior_point:
+        sources.append(
+            {
+                "id": "src-osm-geometry-interior-point",
+                "title": (
+                    "OpenStreetMap boundary relation geometry, "
+                    "polygon representative points"
+                ),
+                "url": OSM_GEOMETRY_DOCUMENTATION_URL,
+                "publisher": "OpenStreetMap contributors",
+                "source_type": "official_open_data",
+                "authority_tier": 2,
+                "geographic_scope": [],
+                "topics_supported": [
+                    "representative point coordinates",
+                ],
+                "published_at": None,
+                "effective_date": None,
+                "expires_at": None,
+                "last_checked": research_date,
+                "confidence": "medium",
+                "review_status": "machine_collected_unreviewed",
+                "volatile": True,
+                "review_interval_days": 180,
+                "canonical_url": OSM_GEOMETRY_DOCUMENTATION_URL,
+                "dataset_details": {
+                    "dataset_name": (
+                        "OpenStreetMap boundary relation geometry "
+                        "(out geom)"
+                    ),
+                    "dataset_page_url": (
+                        OSM_GEOMETRY_DOCUMENTATION_URL
+                    ),
+                    "service_or_download_url": (
+                        "https://overpass-api.de/api/interpreter"
+                    ),
+                    "layer_name": "relation geometry",
+                    "layer_identifier": (
+                        "boundary=administrative relation members "
+                        "with geometry"
+                    ),
+                    "geometry_updated_at": None,
+                    "coordinate_reference_system": "EPSG:4326",
+                },
+                "access_notes": (
+                    "The relation's member way geometries are fetched "
+                    "from Overpass with the 'out geom' modifier, "
+                    "assembled into a (multi)polygon, and "
+                    "shapely.representative_point() is used to "
+                    "compute a guaranteed-interior point. The "
+                    "geometry is ODbL 1.0 data contributed to "
+                    "OpenStreetMap. Used only for zones where no "
+                    "admin_centre or label node is available."
+                ),
+                "limitations": [
+                    "The representative point is computed from the "
+                    "boundary polygon: guaranteed to lie inside the "
+                    "boundary, but not an administrative seat or "
+                    "official reference coordinate.",
+                    "Point quality depends on polygon completeness in "
+                    "OSM. A missing or broken outer ring causes the "
+                    "relation to be skipped and its point left null.",
                 ],
                 "notes": None,
             }
@@ -2620,9 +3181,45 @@ def resolve_profile(
 
     if boundary_level is None and child_level is None:
         if profile is not None:
+            if not profile.verified:
+                known = ", ".join(
+                    sorted(
+                        code
+                        for code, candidate in COUNTRY_PROFILES.items()
+                        if candidate.verified
+                    )
+                )
+                log.error(
+                    f"Country {country_code} has a CANDIDATE profile "
+                    "but it has not been probe-verified.",
+                    f"The profile for {country_code} is a documented "
+                    "hypothesis: plausible levels based on adjacent "
+                    "countries, not confirmed by reading a probe.\n\n"
+                    "A candidate profile must never run silently, "
+                    "because wrong levels produce a file that "
+                    "validates and describes the wrong tier of "
+                    "geography.\n\n"
+                    "Two ways forward.\n\n"
+                    f"1. Probe and confirm:\n"
+                    f"     --probe {country_code}\n"
+                    "   Then run with explicit levels:\n"
+                    f"     --market {country_code.lower()}-<subdivision>"
+                    " --boundary-level N --child-level M\n\n"
+                    "2. Promote the profile to verified=True in "
+                    "COUNTRY_PROFILES after reading a probe output, "
+                    "then re-run without explicit levels.\n\n"
+                    f"Verified today: {known}",
+                )
+                return None
             return profile
 
-        known = ", ".join(sorted(COUNTRY_PROFILES))
+        known = ", ".join(
+            sorted(
+                code
+                for code, candidate in COUNTRY_PROFILES.items()
+                if candidate.verified
+            )
+        )
 
         log.error(
             f"Country {country_code} has no verified profile and no "
@@ -2715,6 +3312,7 @@ def resolve_profile(
             f"Admin levels supplied explicitly: boundary "
             f"{boundary_level}, children {child_level}."
         ),
+        verified=True,
     )
 
     return resolved
@@ -2832,8 +3430,9 @@ def extract(
     else:
         log.info(
             "Generic reference path: representative points from OSM "
-            "admin_centre nodes, population from OSM population tags "
-            "where present.",
+            "admin_centre or label nodes, with polygon interior-point "
+            "fallback where both are absent, and population from OSM "
+            "population tags where present.",
             "Both are weaker than a national census layer and are "
             "recorded at their real authority tier. Where either is "
             "absent the field is null and the zone carries a "
@@ -2934,6 +3533,53 @@ def extract(
             ],
         )
 
+    # Upgrade 3.1.0: fetch polygon interior points as a fallback for
+    # any child relation that got neither an admin_centre nor a label
+    # node. Only attempted if shapely is available, because the
+    # geometry fetcher degrades gracefully without it.
+    if want_centres and children and _SHAPELY_AVAILABLE:
+        centre_covered = set(context.admin_centres)
+        geometry_needed = [
+            element["id"]
+            for element in children
+            if isinstance(element.get("id"), int)
+            and element["id"] not in centre_covered
+        ]
+
+        if geometry_needed:
+            context.geometry_interior_points = (
+                fetch_geometry_for_relations(
+                    fetcher, log, geometry_needed
+                )
+            )
+
+    # Upgrade 3.1.0: geometry-based containment filter. Fetch the
+    # boundary polygon once; test each child's representative point
+    # with shapely covers (which accepts points on the boundary line).
+    # Children that fall outside are excluded, logged individually.
+    # Children with no point at all are included but flagged.
+    #
+    # This replaces the blanket "no containment filter" warning for
+    # the generic path: that warning now fires only when boundary
+    # geometry or shapely is unavailable.
+    boundary_polygon = None
+    geom_filter_available = False
+
+    if (
+        not context.is_us_census
+        and _SHAPELY_AVAILABLE
+        and boundary_relation_id is not None
+        and children
+    ):
+        boundary_polygon = fetch_boundary_polygon(
+            fetcher, log, boundary_relation_id
+        )
+        geom_filter_available = boundary_polygon is not None
+
+    skipped_geom_outside = 0
+    untestable_no_point: list[str] = []
+    geom_tested = 0
+
     # A name-to-GEOID index restricted to this state, used only when
     # OSM carries no FIPS tag. Restricting it means a Franklin County
     # in Vermont cannot match a Franklin County in Ohio.
@@ -2975,11 +3621,10 @@ def extract(
         # GEOID is its state FIPS followed by a three-digit county
         # code. No name matching is involved.
         #
-        # THE GENERIC PATH HAS NO EQUIVALENT FILTER. There is no
-        # worldwide identifier with a containment property, so a
-        # generic run may include a neighbouring district that shares a
-        # boundary line. The count is reported at the end of the run so
-        # a discrepancy is visible rather than silent.
+        # The generic path now uses a geometry containment filter where
+        # shapely and boundary geometry are both available. Where they
+        # are not, the run stays honest about that at the end rather
+        # than quietly pretending containment was tested.
         if spec.state_fips and fallback:
             if not fallback.startswith(spec.state_fips):
                 skipped_outside += 1
@@ -2989,6 +3634,49 @@ def extract(
                     "borders this market but lies outside it."
                 )
                 continue
+
+        # Geometry containment filter (generic path only).
+        # Only runs when boundary_polygon was successfully fetched.
+        if (
+            geom_filter_available
+            and boundary_polygon is not None
+            and not context.is_us_census
+        ):
+            # Determine the point for this element from whatever
+            # source is available, before build_zone is called.
+            relation_id_elem = element.get("id")
+            point_for_filter: Optional[tuple[float, float]] = None
+
+            ac = context.admin_centres.get(relation_id_elem)
+            if ac is not None and isinstance(ac.get("lat"), (int, float)):
+                point_for_filter = (ac["lon"], ac["lat"])
+            else:
+                gi = context.geometry_interior_points.get(
+                    relation_id_elem
+                )
+                if gi is not None:
+                    point_for_filter = (gi["lon"], gi["lat"])
+
+            if point_for_filter is not None:
+                geom_tested += 1
+                pt = Point(point_for_filter)
+
+                if not boundary_polygon.covers(pt):
+                    skipped_geom_outside += 1
+                    log.info(
+                        f"Skipped {name}, which borders this market "
+                        "but lies outside it (geometry containment)."
+                    )
+                    continue
+            else:
+                # No point at all: cannot test containment; include
+                # the zone but flag it.
+                untestable_no_point.append(name)
+                log.warn(
+                    f"{name} has no representative point and could "
+                    "not be geometry-tested; included but may be "
+                    "outside the market boundary."
+                )
 
         zone = build_zone(
             element,
@@ -3025,19 +3713,26 @@ def extract(
     )
 
     if not context.is_us_census and len(zones) > 1:
-        log.warn(
-            f"No containment filter is available for "
-            f"{spec.country_code}, so a neighbouring "
-            f"{profile.child_zone_type} sharing a boundary line may "
-            "be included.",
-            f"Overpass area matching returns relations that intersect "
-            f"the parent, not only those inside it. Check that "
-            f"{len(zones) - 1} matches the number of "
-            f"{profile.child_zone_type} records "
-            f"{spec.subdivision_name} actually has. The US path "
-            "filters this exactly on GEOID prefix; nothing equivalent "
-            "exists worldwide.",
-        )
+        if geom_filter_available:
+            log.info(
+                f"Geometry containment filter applied: "
+                f"{geom_tested} children tested, "
+                f"{skipped_geom_outside} excluded, "
+                f"{len(untestable_no_point)} untestable (no point)."
+            )
+        else:
+            log.warn(
+                f"No containment filter is available for "
+                f"{spec.country_code}, so a neighbouring "
+                f"{profile.child_zone_type} sharing a boundary line "
+                "may be included.",
+                "Boundary geometry could not be fetched or shapely is "
+                "unavailable. Overpass area matching returns relations "
+                "that intersect the parent, not only those inside it. "
+                "Check that the child count matches the number of "
+                f"{profile.child_zone_type} records "
+                f"{spec.subdivision_name} actually has.",
+            )
 
     with_points = sum(
         1
@@ -3077,6 +3772,9 @@ def extract(
             include_admin_centre=bool(context.admin_centres),
             include_osm_population=with_population > 0
             and not context.is_us_census,
+            include_geometry_interior_point=bool(
+                context.geometry_interior_points
+            ),
             boundary_relation_id=boundary_relation_id,
         ),
         "handoff": {
@@ -3115,14 +3813,35 @@ def extract(
                     "exists for this country in this extractor.",
                     f"Representative points: {with_points} of "
                     f"{len(zones) - 1} zones have one, taken from OSM "
-                    "admin_centre member nodes. The rest are null.",
+                    "admin_centre/label member nodes or polygon "
+                    "interior points. The rest are null.",
                     f"Population: {with_population} of "
                     f"{len(zones) - 1} zones have one, from OSM "
                     "population tags. Tier 3, usually undated, and "
                     "must be replaced before publication.",
-                    "No containment filter was applied, because no "
-                    "worldwide identifier supports one. Verify the "
-                    "child count against an official list.",
+                    (
+                        f"Geometry containment filter: "
+                        f"{geom_tested} children tested, "
+                        f"{skipped_geom_outside} excluded as outside "
+                        f"the boundary polygon, "
+                        f"{len(untestable_no_point)} untestable (no "
+                        "representative point)."
+                    )
+                    if geom_filter_available
+                    else
+                    "No containment filter was applied: boundary "
+                    "geometry was unavailable or shapely is not "
+                    "installed. Verify the child count against an "
+                    "official list.",
+                    *(
+                        [
+                            f"Untestable zones (no point, could not "
+                            f"test containment): "
+                            + ", ".join(untestable_no_point)
+                        ]
+                        if untestable_no_point
+                        else []
+                    ),
                 ]
             ),
             "next_step": (
@@ -3155,8 +3874,9 @@ def print_probe(country_code: str, results: dict[int, list[str]]) -> None:
     profile = COUNTRY_PROFILES.get(country_code)
 
     if profile is not None:
+        status = "verified" if profile.verified else "CANDIDATE"
         print(
-            f"This country already has a verified profile: boundary "
+            f"This country already has a {status} profile: boundary "
             f"level {profile.boundary_level}, children level "
             f"{profile.child_level}."
         )
@@ -3295,9 +4015,20 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--probe-batch",
+        metavar="CC[,CC...]",
+        default=None,
+        help=(
+            "Comma-separated ISO 3166-1 alpha-2 codes. Run probe for "
+            "each (reusing cache), then print a comparison table. "
+            "Example: --probe-batch KE,UG,ZM"
+        ),
+    )
+
+    parser.add_argument(
         "--list-countries",
         action="store_true",
-        help="List verified country profiles and exit.",
+        help="List country profiles and exit.",
     )
 
     parser.add_argument(
@@ -3424,21 +4155,23 @@ def main() -> int:
     if args.list_countries:
         print()
         print("=" * 64)
-        print("VERIFIED COUNTRY PROFILES")
+        print("COUNTRY PROFILES")
         print("=" * 64)
         print()
         print(
-            "Each entry was confirmed by someone who ran --probe and "
-            "read the\nresult. Nothing here is inferred from a "
-            "neighbouring country."
+            "VERIFIED entries were confirmed by someone who ran "
+            "--probe and\nread the result. CANDIDATE entries are "
+            "documented hypotheses and\nrequire explicit "
+            "--boundary-level and --child-level."
         )
         print()
 
         for code in sorted(COUNTRY_PROFILES):
             profile = COUNTRY_PROFILES[code]
+            status = "VERIFIED" if profile.verified else "CANDIDATE"
 
             print(
-                f"  {code}  {profile.country_name:<20} "
+                f"  {code}  {status:<10} {profile.country_name:<20} "
                 f"level {profile.boundary_level} "
                 f"{profile.boundary_zone_type} -> "
                 f"level {profile.child_level} "
@@ -3496,12 +4229,67 @@ def main() -> int:
 
         return 0
 
+    if args.probe_batch:
+        codes = [c.strip().upper() for c in args.probe_batch.split(",") if c.strip()]
+
+        if not codes:
+            log.error("--probe-batch requires at least one country code.")
+            log.print(verbose=args.verbose)
+            return 1
+
+        batch_results: dict[str, dict[int, list[str]]] = {}
+        fetcher = Fetcher(args.cache_dir, log, offline=args.offline)
+
+        for cc in codes:
+            time.sleep(REQUEST_DELAY_SECONDS)
+            results = probe_country(fetcher, log, cc)
+            batch_results[cc] = results
+
+        print()
+        print("=" * 72)
+        print("PROBE BATCH RESULTS")
+        print("=" * 72)
+        print()
+
+        # Header row
+        level_cols = list(PROBE_LEVELS)
+        header = f"  {'CC':<4}  {'STATUS':<12}"
+        for lv in level_cols:
+            header += f"  {'L'+str(lv):>6}"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+
+        for cc in codes:
+            prof = COUNTRY_PROFILES.get(cc)
+
+            if prof is None:
+                status = "no profile"
+            elif prof.verified:
+                status = "VERIFIED"
+            else:
+                status = "CANDIDATE"
+
+            row = f"  {cc:<4}  {status:<12}"
+            counts = batch_results.get(cc, {})
+
+            for lv in level_cols:
+                names = counts.get(lv, [])
+                row += f"  {len(names):>6}"
+
+            print(row)
+
+        print()
+        print("Level column shows number of relations found.")
+        print()
+
+        return 0
+
     # --- Extract ------------------------------------------------
 
     if not args.market:
         print(
-            "ERROR: --market is required, unless using --probe or "
-            "--list-countries."
+            "ERROR: --market is required, unless using --probe, "
+            "--probe-batch or --list-countries."
         )
         return 1
 
