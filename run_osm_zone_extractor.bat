@@ -11,7 +11,7 @@ rem ================================================================
 cd /d "%~dp0.."
 
 set "PYTHON=.venv\Scripts\python.exe"
-set "EXTRACTOR=src\osm_zone_extractor.py"
+set "EXTRACTOR=osm_zone_extractor.py"
 set "RESEARCH_DIR=research\market"
 set "CACHE_DIR=.cache\osm"
 set "ENV_FILE=.env"
